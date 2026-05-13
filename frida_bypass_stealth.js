@@ -14,12 +14,17 @@ function wrap(name, fn) {
 
 // ==================== THREAD RENAMING ====================
 
+var _setnameFn = null;
+
 function renameFridaThreads() {
     try {
-        var pthread = Process.findModuleByName("libc.so");
-        if (!pthread) return;
-        var setname = pthread.findExportByName("pthread_setname_np");
-        if (!setname || setname.isNull()) return;
+        if (!_setnameFn) {
+            var pthread = Process.findModuleByName("libc.so");
+            if (!pthread) return;
+            var setname = pthread.findExportByName("pthread_setname_np");
+            if (!setname || setname.isNull()) return;
+            _setnameFn = new NativeFunction(setname, 'int', ['pointer', 'pointer']);
+        }
 
         var newNames = ["RenderThread", "WorkerThread", "JobThread", "GLThread", "NetworkThread", "IOThread", "AudioThread"];
         var threads = Process.enumerateThreads();
@@ -27,13 +32,13 @@ function renameFridaThreads() {
         for (var i = 0; i < threads.length; i++) {
             var t = threads[i];
             var tname = t.name || "";
+            // Only rename threads with suspicious names (Frida/agent/gum related)
             if (tname.indexOf("frida") !== -1 || tname.indexOf("gum") !== -1 ||
-                tname.indexOf("pool") !== -1 || tname.indexOf("agent") !== -1 ||
-                tname === "main" || tname === "threaded-ml" || tname === "") {
-                var newName = Memory.allocUtf8String(newNames[nameIdx % newNames.length]);
-                var fn = new NativeFunction(setname, 'int', ['pointer', 'pointer']);
-                fn(ptr(t.id), newName);
-                log("Renamed thread " + t.id + " (" + tname + ") -> " + newNames[nameIdx % newNames.length]);
+                tname.indexOf("agent") !== -1 || tname === "threaded-ml") {
+                var newNameStr = newNames[nameIdx % newNames.length];
+                var newName = Memory.allocUtf8String(newNameStr);
+                _setnameFn(ptr(t.id), newName);
+                log("Renamed thread " + t.id + " (" + tname + ") -> " + newNameStr);
                 nameIdx++;
             }
         }
@@ -255,7 +260,7 @@ function hookSyscall() {
                 // openat syscall on arm64 = 56, on x86_64 = 257
                 if (num === 56 || num === 257) {
                     var path = safeReadUtf8(args[1]);
-                    if (path && path.indexOf("/proc/") !== -1) {
+                    if (path && (path === "/proc/self/maps" || path === "/proc/self/status")) {
                         log("syscall openat: " + path);
                     }
                 }
@@ -349,7 +354,7 @@ function main() {
     hookOpen();
     hookAccess();
     hookStat();
-    hookSyscall();
+    // hookSyscall(); // DISABLED: causes game freeze on libhoudini
     hookGlGetString();
     hookEglQueryString();
     hookPtrace();
@@ -358,10 +363,10 @@ function main() {
     renameFridaThreads();
     wipeFridaStrings();
 
-    // Periodic thread re-check
+    // Periodic thread re-check (every 30s to avoid overhead)
     setInterval(function() {
         renameFridaThreads();
-    }, 5000);
+    }, 30000);
 
     log("=== Stealth Bypass Ready ===");
 }
