@@ -132,6 +132,24 @@ function hookPropertyGet() {
             "ro.sf.lcd_density": "450"
         };
 
+        var fpPtrs = {};
+        for (var k in fp) { fpPtrs[k] = Memory.allocUtf8String(fp[k]); }
+
+        function applyPropSpoof(key, valuePtr) {
+            if (!key || !valuePtr) return false;
+            if (x86Hide[key]) {
+                log("Hide x86 prop: " + key);
+                valuePtr.writeUtf8String("");
+                return true;
+            }
+            if (fp[key]) {
+                log("Prop " + key + " -> " + fp[key]);
+                valuePtr.writeUtf8String(fp[key]);
+                return true;
+            }
+            return false;
+        }
+
         Interceptor.attach(addr, {
             onEnter: wrap("prop.onEnter", function(args) {
                 this.key = safeReadUtf8(args[0]);
@@ -139,20 +157,85 @@ function hookPropertyGet() {
             }),
             onLeave: wrap("prop.onLeave", function(retval) {
                 if (!this.key || !this.buf) return;
-                if (x86Hide[this.key]) {
-                    log("Hide x86 prop: " + this.key);
-                    this.buf.writeUtf8String("");
-                    retval.replace(0);
-                    return;
-                }
-                if (fp[this.key]) {
-                    log("Prop " + this.key + " -> " + fp[this.key]);
-                    this.buf.writeUtf8String(fp[this.key]);
-                    retval.replace(fp[this.key].length);
+                if (applyPropSpoof(this.key, this.buf)) {
+                    retval.replace(fp[this.key] ? fp[this.key].length : 0);
                 }
             })
         });
         log("property_get hooked");
+
+        // Hook __system_property_find to hide x86 properties
+        var findAddr = null;
+        for (var i = 0; i < exps.length; i++) { if (exps[i].name === "__system_property_find") { findAddr = exps[i].address; break; } }
+        if (findAddr) {
+            Interceptor.attach(findAddr, {
+                onEnter: wrap("propFind.onEnter", function(args) { this.key = safeReadUtf8(args[0]); }),
+                onLeave: wrap("propFind.onLeave", function(retval) {
+                    if (this.key && x86Hide[this.key]) {
+                        log("Hide x86 find: " + this.key);
+                        retval.replace(0);
+                    }
+                })
+            });
+            log("property_find hooked");
+        }
+
+        // Hook __system_property_read_callback to spoof values
+        var rcAddr = null;
+        for (var i = 0; i < exps.length; i++) { if (exps[i].name === "__system_property_read_callback") { rcAddr = exps[i].address; break; } }
+        if (rcAddr) {
+            Interceptor.attach(rcAddr, {
+                onEnter: wrap("propRC.onEnter", function(args) {
+                    var origCallback = args[1];
+                    var origFn = new NativeFunction(origCallback, 'void', ['pointer', 'pointer', 'pointer', 'uint32']);
+                    var wrapper = new NativeCallback(function(cookie, name, value, serial) {
+                        var nameStr = name ? Memory.readUtf8String(name) : null;
+                        if (nameStr && x86Hide[nameStr]) return;
+                        if (nameStr && fp[nameStr]) {
+                            origFn(cookie, name, fpPtrs[nameStr], serial);
+                            return;
+                        }
+                        origFn(cookie, name, value, serial);
+                    }, 'void', ['pointer', 'pointer', 'pointer', 'uint32']);
+                    args[1] = wrapper;
+                })
+            });
+            log("property_read_callback hooked");
+        }
+
+        // Hook __system_property_read to spoof values
+        var readAddr = null;
+        for (var i = 0; i < exps.length; i++) { if (exps[i].name === "__system_property_read") { readAddr = exps[i].address; break; } }
+        if (readAddr) {
+            Interceptor.attach(readAddr, {
+                onEnter: wrap("propRead.onEnter", function(args) {
+                    this.nameBuf = args[1];
+                    this.valueBuf = args[2];
+                }),
+                onLeave: wrap("propRead.onLeave", function(retval) {
+                    var nameStr = this.nameBuf ? safeReadUtf8(this.nameBuf) : null;
+                    if (nameStr && this.valueBuf) {
+                        if (applyPropSpoof(nameStr, this.valueBuf)) {
+                            retval.replace(fp[nameStr] ? fp[nameStr].length : 0);
+                        }
+                    }
+                })
+            });
+            log("property_read hooked");
+        }
+
+        // Log __system_property_foreach usage (not spoofing yet, just detection)
+        var foreachAddr = null;
+        for (var i = 0; i < exps.length; i++) { if (exps[i].name === "__system_property_foreach") { foreachAddr = exps[i].address; break; } }
+        if (foreachAddr) {
+            Interceptor.attach(foreachAddr, {
+                onEnter: wrap("propForeach.onEnter", function(args) {
+                    log("property_foreach called");
+                })
+            });
+            log("property_foreach logged");
+        }
+
     } catch(e) { log("hookPropertyGet error: " + e); }
 }
 
