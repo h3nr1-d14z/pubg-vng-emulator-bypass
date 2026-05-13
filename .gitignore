@@ -1,0 +1,38 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# Logs
+*.log
+
+# Fake data files (user-specific, may contain sensitive info)
+fake_cpuinfo
+fake_build.prop
+fake_status
+fake_maps
+
+# Temporary
+*.tmp
+tmp/
+temp/
+
+# Frida
+*.trace
+
+# Claude / OMC local state
+.omc/
+.claude/
