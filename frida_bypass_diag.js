@@ -1,5 +1,6 @@
-// Emulator bypass - DIAGNOSTIC VERSION
+// Emulator bypass - DIAGNOSTIC VERSION (Consolidated)
 // Wrapped callbacks to identify TypeError source
+// Integrated: stealth Java hooks, syscall fallback, safe ptrace, XID patcher
 
 var ANOGS_PORT = 17500;
 var AES_KEY = null;
@@ -27,7 +28,6 @@ function safeReadUtf8(ptr) {
     } catch(e) { return null; }
 }
 
-// Wrap a callback to catch and log errors
 function wrap(hookName, fn) {
     return function() {
         try {
@@ -38,7 +38,15 @@ function wrap(hookName, fn) {
     };
 }
 
-// Build fake maps file by filtering current process maps
+function readBufferSafe(ptr, len) {
+    if (!ptr || ptr.isNull() || len <= 0 || len > 65535) return null;
+    try {
+        var raw = Memory.readByteArray(ptr, len);
+        if (!raw) return null;
+        return new Uint8Array(raw);
+    } catch(e) { return null; }
+}
+
 function buildFakeMaps() {
     try {
         var f = new File(FAKE_MAPS_PATH, "r");
@@ -48,6 +56,8 @@ function buildFakeMaps() {
         log("Fake maps missing, skipping maps build");
     }
 }
+
+// ==================== PROPERTY SPOOFING ====================
 
 function hookPropertyGet() {
     try {
@@ -144,10 +154,26 @@ function hookPropertyRead() {
     } catch(e) { log("hookPropertyRead error: " + e); }
 }
 
+// ==================== FILE REDIRECTION ====================
+
 var fakeCpuinfo = Memory.allocUtf8String("/data/local/tmp/fake_cpuinfo");
 var fakeBuildProp = Memory.allocUtf8String("/data/local/tmp/fake_build.prop");
 var fakeStatus = Memory.allocUtf8String("/data/local/tmp/fake_status");
 var fakeMaps = Memory.allocUtf8String(FAKE_MAPS_PATH);
+var fakeSelinux = Memory.allocUtf8String("/data/local/tmp/fake_selinux");
+var devnull = Memory.allocUtf8String("/dev/null");
+var fakeNotExist = Memory.allocUtf8String("/data/local/tmp/.nonexistent_root_hide");
+
+var rootPaths = [
+    "/system/bin/su", "/system/xbin/su", "/sbin/su", "/su/bin/su",
+    "/system/bin/.ext/.su", "/system/xbin/.ext/.su",
+    "/system/app/Superuser.apk", "/system/app/SuperSU",
+    "/system/bin/magisk", "/system/xbin/magisk", "/sbin/magisk",
+    "/magisk", "/.magisk", "/sbin/.magisk",
+    "/data/adb/magisk", "/data/adb/ksu",
+    "/system/etc/init.d", "/system/sbin",
+    "/vendor/bin/su", "/vendor/xbin/su"
+];
 
 function redirectPath(pathPtr, pathStr) {
     if (!pathStr) return pathPtr;
@@ -167,10 +193,19 @@ function redirectPath(pathPtr, pathStr) {
         log("Redirect maps");
         return fakeMaps;
     }
+    if (pathStr === "/sys/fs/selinux/enforce") {
+        log("Redirect selinux enforce");
+        return fakeSelinux;
+    }
     if (pathStr.indexOf("/sys/devices/system/cpu/") !== -1 && pathStr.indexOf("topology") !== -1) {
         log("Block topology: " + pathStr);
-        var devnull = Memory.allocUtf8String("/dev/null");
         return devnull;
+    }
+    for (var i = 0; i < rootPaths.length; i++) {
+        if (pathStr === rootPaths[i] || pathStr.indexOf(rootPaths[i]) === 0) {
+            log("Hide root path: " + pathStr);
+            return fakeNotExist;
+        }
     }
     return pathPtr;
 }
@@ -262,6 +297,90 @@ function hookStat() {
     } catch(e) { log("hookStat error: " + e); }
 }
 
+// ==================== GPU SPOOFING ====================
+
+var fakeGlVendor = Memory.allocUtf8String("Qualcomm");
+var fakeGlRenderer = Memory.allocUtf8String("Adreno (TM) 750");
+var fakeGlVersion = Memory.allocUtf8String("OpenGL ES 3.2 V@0502.0 (GIT@6b5250b, I229597d848, 1702482879) (Date:12/13/23)");
+var fakeEglVendor = Memory.allocUtf8String("Qualcomm");
+var fakeEglVersion = Memory.allocUtf8String("1.5");
+
+function hookGlGetString() {
+    try {
+        var libGLESv2 = Process.findModuleByName("libGLESv2.so");
+        var libGLESv3 = Process.findModuleByName("libGLESv3.so");
+        var libEGL = Process.findModuleByName("libEGL.so");
+
+        function attachToModule(mod) {
+            if (!mod) return;
+            var exps = mod.enumerateExports();
+            var addr = null;
+            for (var i = 0; i < exps.length; i++) {
+                if (exps[i].name === "glGetString") {
+                    addr = exps[i].address;
+                    break;
+                }
+            }
+            if (!addr || addr.isNull()) return;
+            Interceptor.attach(addr, {
+                onLeave: wrap("glGetString.onLeave", function(retval) {
+                    var name = this.name;
+                    if (name === 0x1F00) {
+                        log("glGetString(GL_VENDOR) -> Qualcomm");
+                        retval.replace(fakeGlVendor);
+                    } else if (name === 0x1F01) {
+                        log("glGetString(GL_RENDERER) -> Adreno (TM) 750");
+                        retval.replace(fakeGlRenderer);
+                    } else if (name === 0x1B02) {
+                        log("glGetString(GL_VERSION) -> OpenGL ES 3.2");
+                        retval.replace(fakeGlVersion);
+                    }
+                }),
+                onEnter: wrap("glGetString.onEnter", function(args) {
+                    this.name = args[0].toInt32();
+                })
+            });
+            log("Hooked glGetString in " + mod.name);
+        }
+
+        attachToModule(libGLESv2);
+        attachToModule(libGLESv3);
+        attachToModule(libEGL);
+    } catch(e) { log("hookGlGetString error: " + e); }
+}
+
+function hookEglQueryString() {
+    try {
+        var libEGL = Process.findModuleByName("libEGL.so");
+        if (!libEGL) return;
+        var exps = libEGL.enumerateExports();
+        var addr = null;
+        for (var i = 0; i < exps.length; i++) {
+            if (exps[i].name === "eglQueryString") {
+                addr = exps[i].address;
+                break;
+            }
+        }
+        if (!addr || addr.isNull()) return;
+        Interceptor.attach(addr, {
+            onEnter: wrap("eglQueryString.onEnter", function(args) {
+                this.name = args[1].toInt32();
+            }),
+            onLeave: wrap("eglQueryString.onLeave", function(retval) {
+                var n = this.name;
+                if (n === 0x3053) {
+                    log("eglQueryString(EGL_VENDOR) -> Qualcomm");
+                    retval.replace(fakeEglVendor);
+                } else if (n === 0x3054) {
+                    log("eglQueryString(EGL_VERSION) -> 1.5");
+                    retval.replace(fakeEglVersion);
+                }
+            })
+        });
+        log("Hooked eglQueryString");
+    } catch(e) { log("hookEglQueryString error: " + e); }
+}
+
 // ==================== NETWORK PATCH ====================
 
 function bytesToHex(buffer) {
@@ -336,100 +455,85 @@ function callJavaAes(dataArray, keyArray, ivArray, mode) {
     return out;
 }
 
+function calcDeviceHash() {
+    if (typeof Java === 'undefined' || !Java.available) {
+        return "9fe5bc9ba47e3ed39c9b6860d2eb15d8bce6b2a95d24ec67eb152557b2883b4d";
+    }
+    var hash = null;
+    try {
+        Java.perform(function() {
+            try {
+                var MessageDigest = Java.use("java.security.MessageDigest");
+                var md = MessageDigest.getInstance("SHA-256");
+                var input = "samsung|SM-S928B|e3q|qcom|14|UP1A.231005.007|S928BXXU1AWM9|pineapple|release-keys|user";
+                var jBytes = Java.array('byte', Array.from(input).map(function(c) { return c.charCodeAt(0); }));
+                var digest = md.digest(jBytes);
+                hash = Array.from(digest).map(function(b) {
+                    var ub = b < 0 ? b + 256 : b;
+                    return ("0" + ub.toString(16)).slice(-2);
+                }).join("");
+            } catch (e) {}
+        });
+    } catch (e) { log("calcDeviceHash error: " + e); }
+    return hash || "9fe5bc9ba47e3ed39c9b6860d2eb15d8bce6b2a95d24ec67eb152557b2883b4d";
+}
+
 function patchTelemetry(plain) {
     var out = [];
     var i = 0;
-    while (i < plain.length - 2) {
-        var t = plain[i];
-        var l = plain[i + 1];
-        if (l > 128 || i + 2 + l > plain.length) {
+    var newXid = calcDeviceHash();
+    var keyMap = [
+        ["EmulatorName", "SM-S928B"],
+        ["GLRender", "Adreno (TM) 750"],
+        ["DeviceModel", "SM-S928B"],
+        ["DeviceName", "SM-S928B"],
+        ["DeviceMake", "samsung"],
+        ["SystemHardware", "qcom+samsung"],
+        ["XID", newXid]
+    ];
+
+    while (i < plain.length) {
+        var matched = false;
+        for (var ki = 0; ki < keyMap.length; ki++) {
+            var kstr = keyMap[ki][0];
+            var klen = kstr.length;
+            if (i + 2 + klen <= plain.length && plain[i] === 0x03 && plain[i+1] === klen) {
+                var match = true;
+                for (var ci = 0; ci < klen; ci++) {
+                    if (plain[i + 2 + ci] !== kstr.charCodeAt(ci)) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    out.push(0x03); out.push(klen);
+                    for (var c = 0; c < klen; c++) out.push(kstr.charCodeAt(c));
+                    i += 2 + klen;
+
+                    if (i + 1 < plain.length) {
+                        var vt = plain[i];
+                        var vl = plain[i+1];
+                        if (vl <= 200 && i + 2 + vl <= plain.length) {
+                            var newVal = keyMap[ki][1];
+                            if (newVal) {
+                                log("Patch " + kstr + " -> " + newVal);
+                                out.push(0x03); out.push(newVal.length);
+                                for (var vi = 0; vi < newVal.length; vi++) out.push(newVal.charCodeAt(vi));
+                                i += 2 + vl;
+                                matched = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (!matched) {
             out.push(plain[i]);
             i++;
-            continue;
-        }
-        var v = plain.slice(i + 2, i + 2 + l);
-        var modified = false;
-
-        if (t === 0x03) {
-            try {
-                var str = "";
-                for (var si = 0; si < v.length; si++) str += String.fromCharCode(v[si]);
-
-                if (str.indexOf("LeiDian") !== -1 || str.indexOf("X86") !== -1 || str === "EmulatorName" ||
-                    str.indexOf("LDPlayer") !== -1 || str.indexOf("ldplayer") !== -1 ||
-                    str.indexOf("x86") !== -1 || str.indexOf("houdini") !== -1) {
-                    log("Patching EmulatorName at offset " + i + ": " + str);
-                    var newVal = "SM-S928B";
-                    out.push(0x03);
-                    out.push(newVal.length);
-                    for (var k = 0; k < newVal.length; k++) out.push(newVal.charCodeAt(k));
-                    i += 2 + l;
-                    modified = true;
-                } else if (str.indexOf("GenericGPUBrand") !== -1 || str === "GLRender" ||
-                           str.indexOf("Adreno") === -1 && str.indexOf("Mali") === -1 && str.indexOf("PowerVR") === -1 && str.length > 3) {
-                    log("Patching GLRender at offset " + i + ": " + str);
-                    var newVal2 = "Adreno (TM) 750";
-                    out.push(0x03);
-                    out.push(newVal2.length);
-                    for (var k2 = 0; k2 < newVal2.length; k2++) out.push(newVal2.charCodeAt(k2));
-                    i += 2 + l;
-                    modified = true;
-                } else if (str.indexOf("ASUS") !== -1 || str.indexOf("asus") !== -1 || str === "DeviceModel" ||
-                           str.indexOf("ROG") !== -1 || str.indexOf("rog") !== -1 ||
-                           str.indexOf("ai2401") !== -1 || str.indexOf("AI2401") !== -1) {
-                    log("Patching DeviceModel at offset " + i + ": " + str);
-                    var newVal3 = "SM-S928B";
-                    out.push(0x03);
-                    out.push(newVal3.length);
-                    for (var k3 = 0; k3 < newVal3.length; k3++) out.push(newVal3.charCodeAt(k3));
-                    i += 2 + l;
-                    modified = true;
-                } else if (str.indexOf("rog") !== -1 && str.length < 10) {
-                    log("Patching DeviceMake at offset " + i + ": " + str);
-                    var newVal4 = "samsung";
-                    out.push(0x03);
-                    out.push(newVal4.length);
-                    for (var k4 = 0; k4 < newVal4.length; k4++) out.push(newVal4.charCodeAt(k4));
-                    i += 2 + l;
-                    modified = true;
-                } else if (str.indexOf("ROG+ASUS") !== -1 || str === "SystemHardware" ||
-                           str.indexOf("ASUS") !== -1) {
-                    log("Patching SystemHardware at offset " + i + ": " + str);
-                    var newVal5 = "qcom+samsung";
-                    out.push(0x03);
-                    out.push(newVal5.length);
-                    for (var k5 = 0; k5 < newVal5.length; k5++) out.push(newVal5.charCodeAt(k5));
-                    i += 2 + l;
-                    modified = true;
-                } else if (str.indexOf("AuthenticAMD") !== -1 || str.indexOf("AMD") !== -1 || str.indexOf("Intel") !== -1) {
-                    log("Patching CPU vendor at offset " + i + ": " + str);
-                    var newVal6 = "ARM";
-                    out.push(0x03);
-                    out.push(newVal6.length);
-                    for (var k6 = 0; k6 < newVal6.length; k6++) out.push(newVal6.charCodeAt(k6));
-                    i += 2 + l;
-                    modified = true;
-                }
-            } catch (e) {}
-        }
-
-        if (!modified) {
-            out.push(plain[i]);
-            out.push(plain[i + 1]);
-            for (var j = 0; j < l; j++) out.push(plain[i + 2 + j]);
-            i += 2 + l;
         }
     }
     return new Uint8Array(out);
-}
-
-function readBufferSafe(ptr, len) {
-    if (!ptr || ptr.isNull() || len <= 0 || len > 65535) return null;
-    try {
-        var raw = Memory.readByteArray(ptr, len);
-        if (!raw) return null;
-        return new Uint8Array(raw);
-    } catch(e) { return null; }
 }
 
 function processSend(bufPtr, len) {
@@ -474,6 +578,17 @@ function processSend(bufPtr, len) {
     Memory.writeByteArray(newBuf, newPacket.buffer);
     log("Forwarding patched packet");
     return newBuf;
+}
+
+function processRecv(bufPtr, len) {
+    if (len < 32) return;
+    var buf = readBufferSafe(bufPtr, len);
+    if (!buf || buf[0] !== 0x33 || buf[1] !== 0x66) return;
+    var key = extractToken(buf, len);
+    if (key) {
+        AES_KEY = key;
+        log("Extracted AES key from 0x1002: " + bytesToHex(key));
+    }
 }
 
 function hookSend() {
@@ -521,16 +636,6 @@ function hookRecv() {
             }
         }
         log("recvAddr=" + recvAddr + " recvfromAddr=" + recvfromAddr);
-        function processRecv(bufPtr, len) {
-            if (len < 32) return;
-            var buf = readBufferSafe(bufPtr, len);
-            if (!buf || buf[0] !== 0x33 || buf[1] !== 0x66) return;
-            var key = extractToken(buf, len);
-            if (key) {
-                AES_KEY = key;
-                log("Extracted AES key from 0x1002: " + bytesToHex(key));
-            }
-        }
         function installRecv(impl, name) {
             if (!impl || impl.isNull()) return;
             Interceptor.attach(impl, {
@@ -563,7 +668,7 @@ function hookConnect() {
                     if (!sockaddr || sockaddr.isNull()) return;
                     try {
                         var family = Memory.readU16(sockaddr);
-                        if (family === 2) { // AF_INET
+                        if (family === 2) {
                             var port = (Memory.readU8(sockaddr.add(2)) << 8) | Memory.readU8(sockaddr.add(3));
                             var ip = Memory.readU8(sockaddr.add(4)) + "." + Memory.readU8(sockaddr.add(5)) + "." + Memory.readU8(sockaddr.add(6)) + "." + Memory.readU8(sockaddr.add(7));
                             log("connect " + ip + ":" + port);
@@ -579,174 +684,27 @@ function hookConnect() {
     } catch(e) { log("hookConnect error: " + e); }
 }
 
-var fakeGlVendor = Memory.allocUtf8String("Qualcomm");
-var fakeGlRenderer = Memory.allocUtf8String("Adreno (TM) 750");
-var fakeGlVersion = Memory.allocUtf8String("OpenGL ES 3.2 V@0502.0 (GIT@6b5250b, I229597d848, 1702482879) (Date:12/13/23)");
-var fakeEglVendor = Memory.allocUtf8String("Qualcomm");
-var fakeEglVersion = Memory.allocUtf8String("1.5");
+// ==================== PTRACE ANTI-DEBUG ====================
 
-function hookGlGetString() {
-    try {
-        var libGLESv2 = Process.findModuleByName("libGLESv2.so");
-        var libGLESv3 = Process.findModuleByName("libGLESv3.so");
-        var libEGL = Process.findModuleByName("libEGL.so");
-
-        function attachToModule(mod) {
-            if (!mod) return;
-            var exps = mod.enumerateExports();
-            var addr = null;
-            for (var i = 0; i < exps.length; i++) {
-                if (exps[i].name === "glGetString") {
-                    addr = exps[i].address;
-                    break;
-                }
-            }
-            if (!addr || addr.isNull()) return;
-            Interceptor.attach(addr, {
-                onLeave: wrap("glGetString.onLeave", function(retval) {
-                    var name = this.name;
-                    if (name === 0x1F00) { // GL_VENDOR
-                        log("glGetString(GL_VENDOR) -> Qualcomm");
-                        retval.replace(fakeGlVendor);
-                    } else if (name === 0x1F01) { // GL_RENDERER
-                        log("glGetString(GL_RENDERER) -> Adreno (TM) 750");
-                        retval.replace(fakeGlRenderer);
-                    } else if (name === 0x1B02) { // GL_VERSION
-                        log("glGetString(GL_VERSION) -> OpenGL ES 3.2");
-                        retval.replace(fakeGlVersion);
-                    }
-                }),
-                onEnter: wrap("glGetString.onEnter", function(args) {
-                    this.name = args[0].toInt32();
-                })
-            });
-            log("Hooked glGetString in " + mod.name);
-        }
-
-        attachToModule(libGLESv2);
-        attachToModule(libGLESv3);
-        attachToModule(libEGL);
-    } catch(e) { log("hookGlGetString error: " + e); }
-}
-
-function hookEglQueryString() {
-    try {
-        var libEGL = Process.findModuleByName("libEGL.so");
-        if (!libEGL) return;
-        var exps = libEGL.enumerateExports();
-        var addr = null;
-        for (var i = 0; i < exps.length; i++) {
-            if (exps[i].name === "eglQueryString") {
-                addr = exps[i].address;
-                break;
-            }
-        }
-        if (!addr || addr.isNull()) return;
-        Interceptor.attach(addr, {
-            onEnter: wrap("eglQueryString.onEnter", function(args) {
-                this.name = args[1].toInt32();
-            }),
-            onLeave: wrap("eglQueryString.onLeave", function(retval) {
-                var n = this.name;
-                if (n === 0x3053) { // EGL_VENDOR
-                    log("eglQueryString(EGL_VENDOR) -> Qualcomm");
-                    retval.replace(fakeEglVendor);
-                } else if (n === 0x3054) { // EGL_VERSION
-                    log("eglQueryString(EGL_VERSION) -> 1.5");
-                    retval.replace(fakeEglVersion);
-                }
-            })
-        });
-        log("Hooked eglQueryString");
-    } catch(e) { log("hookEglQueryString error: " + e); }
-}
-
-function hookWriteRead() {
+function hookPtrace() {
     try {
         var libc = Process.findModuleByName("libc.so");
         if (!libc) return;
-        var exps = libc.enumerateExports();
-        var writeAddr = null;
-        var readAddr = null;
-        for (var i = 0; i < exps.length; i++) {
-            if (exps[i].name === "write") writeAddr = exps[i].address;
-            if (exps[i].name === "read") readAddr = exps[i].address;
-        }
-        if (writeAddr && !writeAddr.isNull()) {
-            Interceptor.attach(writeAddr, {
-                onEnter: wrap("write.onEnter", function(args) {
-                    var fd = args[0].toInt32();
-                    var buf = args[1];
-                    var len = args[2].toInt32();
-                    if (fd >= 0) {
-                        var newBuf = processSend(buf, len);
-                        if (newBuf) args[1] = newBuf;
-                    }
-                })
-            });
-            log("Hooked write()");
-        }
-        if (readAddr && !readAddr.isNull()) {
-            Interceptor.attach(readAddr, {
-                onEnter: wrap("read.onEnter", function(args) {
-                    this.bufPtr = args[1];
-                }),
-                onLeave: wrap("read.onLeave", function(retval) {
-                    var n = retval.toInt32();
-                    if (n > 0 && this.bufPtr) {
-                        processRecv(this.bufPtr, n);
-                    }
-                })
-            });
-            log("Hooked read()");
-        }
-    } catch(e) { log("hookWriteRead error: " + e); }
-}
-
-function hookSSL() {
-    try {
-        var libssl = Process.findModuleByName("libssl.so");
-        if (!libssl) {
-            log("libssl.so not found");
-            return;
-        }
-        var exps = libssl.enumerateExports();
-        var sslWriteAddr = null;
-        var sslReadAddr = null;
-        for (var i = 0; i < exps.length; i++) {
-            if (exps[i].name === "SSL_write") sslWriteAddr = exps[i].address;
-            if (exps[i].name === "SSL_read") sslReadAddr = exps[i].address;
-        }
-        function installSSLWrite(addr) {
-            if (!addr || addr.isNull()) return;
-            Interceptor.attach(addr, {
-                onEnter: wrap("SSL_write.onEnter", function(args) {
-                    var buf = args[1];
-                    var len = args[2].toInt32();
-                    var newBuf = processSend(buf, len);
-                    if (newBuf) args[1] = newBuf;
-                })
-            });
-            log("Hooked SSL_write");
-        }
-        function installSSLRead(addr) {
-            if (!addr || addr.isNull()) return;
-            Interceptor.attach(addr, {
-                onEnter: wrap("SSL_read.onEnter", function(args) {
-                    this.bufPtr = args[1];
-                }),
-                onLeave: wrap("SSL_read.onLeave", function(retval) {
-                    var n = retval.toInt32();
-                    if (n > 0 && this.bufPtr) {
-                        processRecv(this.bufPtr, n);
-                    }
-                })
-            });
-            log("Hooked SSL_read");
-        }
-        installSSLWrite(sslWriteAddr);
-        installSSLRead(sslReadAddr);
-    } catch(e) { log("hookSSL error: " + e); }
+        var ptraceAddr = libc.findExportByName("ptrace");
+        if (!ptraceAddr || ptraceAddr.isNull()) return;
+        Interceptor.attach(ptraceAddr, {
+            onEnter: wrap("ptrace.onEnter", function(args) {
+                this.request = args[0].toInt32();
+            }),
+            onLeave: wrap("ptrace.onLeave", function(retval) {
+                if (this.request === 0) {
+                    log("Blocked PTRACE_TRACEME");
+                    retval.replace(0);
+                }
+            })
+        });
+        log("Hooked ptrace (anti-debug)");
+    } catch(e) { log("hookPtrace error: " + e); }
 }
 
 // ==================== MAIN ====================
@@ -760,14 +718,12 @@ function installNativeHooks() {
     hookOpen();
     hookAccess();
     hookStat();
-    // hookStrStr(); // disabled for testing
     hookSend();
     hookRecv();
     hookConnect();
     hookGlGetString();
     hookEglQueryString();
-    hookWriteRead();
-    hookSSL();
+    hookPtrace();
     log("=== Native hooks installed ===");
 }
 
@@ -779,18 +735,30 @@ function installJavaHooks() {
     try {
         Java.perform(function() {
             log("Java.perform started");
+
+            // --- Build fields via reflection ---
             try {
                 var Build = Java.use("android.os.Build");
-                var fields = {
+                var buildMap = {
                     "MODEL": "SM-S928B",
                     "DEVICE": "e3q",
                     "MANUFACTURER": "samsung",
                     "BRAND": "samsung",
                     "HARDWARE": "qcom",
                     "PRODUCT": "e3qxxx",
-                    "BOARD": "e3q"
+                    "BOARD": "e3q",
+                    "FINGERPRINT": "samsung/e3qxxx/e3q:14/UP1A.231005.007/S928BXXU1AWM9:user/release-keys",
+                    "BOOTLOADER": "S928BXXU1AWM9",
+                    "ID": "UP1A.231005.007",
+                    "HOST": "android-build",
+                    "TAGS": "release-keys",
+                    "TYPE": "user",
+                    "USER": "dpi",
+                    "DISPLAY": "S928BXXU1AWM9",
+                    "CPU_ABI": "arm64-v8a",
+                    "CPU_ABI2": "armeabi-v7a"
                 };
-                for (var key in fields) {
+                for (var key in buildMap) {
                     (function(k, v) {
                         try {
                             var field = Build.class.getDeclaredField(k);
@@ -800,60 +768,209 @@ function installJavaHooks() {
                         } catch(e) {
                             log("Build." + k + " failed: " + e);
                         }
-                    })(key, fields[key]);
+                    })(key, buildMap[key]);
                 }
+                // SUPPORTED_ABIS array
+                try {
+                    var abisField = Build.class.getDeclaredField("SUPPORTED_ABIS");
+                    abisField.setAccessible(true);
+                    var abis = Java.array('java.lang.String', ["arm64-v8a", "armeabi-v7a", "armeabi"]);
+                    abisField.set(null, abis);
+                    log("Build.SUPPORTED_ABIS patched");
+                } catch(e) { log("Build.SUPPORTED_ABIS failed: " + e); }
             } catch(e) { log("Build hook failed: " + e); }
 
+            // --- SystemProperties ---
             try {
-                var SystemProperties = Java.use("android.os.SystemProperties");
-                var origGet = SystemProperties.get.overload('java.lang.String');
-                origGet.implementation = function(key) {
-                    var fp = {
-                        "ro.hardware": "qcom",
-                        "ro.product.model": "SM-S928B",
-                        "ro.product.device": "e3q",
-                        "ro.product.brand": "samsung",
-                        "ro.product.manufacturer": "samsung",
-                        "ro.kernel.qemu": "0",
-                        "ro.product.cpu.abi": "arm64-v8a",
-                        "ro.arch": "arm64"
-                    };
-                    if (fp[key]) {
-                        log("Java Prop " + key + " -> " + fp[key]);
-                        return fp[key];
-                    }
-                    var val = origGet.call(this, key);
-                    if (val && (val.indexOf("x86") !== -1 || val.indexOf("amd") !== -1 || val.indexOf("AMD") !== -1)) {
-                        log("Java SUS Prop " + key + " = " + val);
-                    }
-                    return val;
+                var SP = Java.use("android.os.SystemProperties");
+                var fakeProps = {
+                    "ro.hardware": "qcom",
+                    "ro.product.model": "SM-S928B",
+                    "ro.product.device": "e3q",
+                    "ro.product.brand": "samsung",
+                    "ro.product.manufacturer": "samsung",
+                    "ro.product.name": "e3qxxx",
+                    "ro.build.fingerprint": "samsung/e3qxxx/e3q:14/UP1A.231005.007/S928BXXU1AWM9:user/release-keys",
+                    "ro.build.product": "e3q",
+                    "ro.board.platform": "sm8650",
+                    "ro.bootloader": "S928BXXU1AWM9",
+                    "ro.build.id": "UP1A.231005.007",
+                    "ro.build.tags": "release-keys",
+                    "ro.build.type": "user",
+                    "ro.build.user": "dpi",
+                    "ro.build.host": "android-build",
+                    "ro.kernel.qemu": "0",
+                    "ro.hardware.vm": "0",
+                    "ro.boot.hardware": "qcom",
+                    "ro.product.board": "e3q",
+                    "ro.boot.qemu": "0"
                 };
+                SP.get.overload('java.lang.String').implementation = function(key) {
+                    if (fakeProps.hasOwnProperty(key)) return fakeProps[key];
+                    var kl = key.toLowerCase();
+                    if (kl.indexOf("qemu") !== -1 || kl.indexOf("ldplayer") !== -1 ||
+                        kl.indexOf("vbox") !== -1 || kl.indexOf("hyperv") !== -1 ||
+                        kl.indexOf("virtio") !== -1) return null;
+                    return this.get(key);
+                };
+                try {
+                    SP.get.overload('java.lang.String', 'java.lang.String').implementation = function(key, def) {
+                        if (fakeProps.hasOwnProperty(key)) return fakeProps[key] || def;
+                        var kl = key.toLowerCase();
+                        if (kl.indexOf("qemu") !== -1 || kl.indexOf("ldplayer") !== -1 ||
+                            kl.indexOf("vbox") !== -1 || kl.indexOf("hyperv") !== -1 ||
+                            kl.indexOf("virtio") !== -1) return def;
+                        return this.get(key, def);
+                    };
+                } catch(e) {}
                 log("SystemProperties.get hooked");
             } catch(e) { log("SystemProperties.get hook failed: " + e); }
+
+            // --- OpenGL (Java layer) ---
+            try {
+                var GLES20 = Java.use("android.opengl.GLES20");
+                var glImpl = function(name) {
+                    if (name === 0x1F00) return "Qualcomm";
+                    if (name === 0x1F01) return "Adreno (TM) 750";
+                    if (name === 0x1F02) return "OpenGL ES 3.2 V@0750.0";
+                    return this.glGetString(name);
+                };
+                GLES20.glGetString.implementation = glImpl;
+                try {
+                    Java.use("android.opengl.GLES30").glGetString.implementation = glImpl;
+                } catch(e) {}
+                log("OpenGL Java hooked");
+            } catch(e) { log("OpenGL Java hook failed: " + e); }
+
+            // --- NetworkInterface MAC ---
+            try {
+                var NI = Java.use("java.net.NetworkInterface");
+                NI.getHardwareAddress.implementation = function() {
+                    var n = this.getName();
+                    if (n && n.toString().indexOf("wlan") !== -1) {
+                        return Java.array('byte', [0x5c,0x02,0x14,0x12,0x34,0x56]);
+                    }
+                    if (n && (n.toString().indexOf("eth") !== -1 || n.toString().indexOf("vbox") !== -1)) return null;
+                    return this.getHardwareAddress();
+                };
+                log("MAC hooked");
+            } catch(e) { log("MAC hook failed: " + e); }
+
+            // --- Settings.Secure ---
+            try {
+                var Secure = Java.use("android.provider.Settings$Secure");
+                Secure.getString.overload('android.content.ContentResolver','java.lang.String').implementation = function(resolver, name) {
+                    if (name === "android_id") return "a1b2c3d4e5f67890";
+                    if (name === "bluetooth_name") return "Galaxy S24 Ultra";
+                    return this.getString(resolver, name);
+                };
+                log("Settings.Secure hooked");
+            } catch(e) { log("Settings.Secure hook failed: " + e); }
+
+            // --- Telephony ---
+            try {
+                var TM = Java.use("android.telephony.TelephonyManager");
+                TM.getDeviceId.overload().implementation = function() { return "355123456789012"; };
+                try { TM.getDeviceId.overload('int').implementation = function(s) { return "355123456789012"; }; } catch(e){}
+                try { TM.getImei.overload().implementation = function() { return "355123456789012"; }; } catch(e){}
+                try { TM.getSubscriberId.overload().implementation = function() { return "310260123456789"; }; } catch(e){}
+                log("Telephony hooked");
+            } catch(e) { log("Telephony hook failed: " + e); }
+
+            // --- Sensors ---
+            try {
+                var SensorManager = Java.use("android.hardware.SensorManager");
+                var originalRegister = SensorManager.registerListener.overload('android.hardware.SensorEventListener','android.hardware.Sensor','int');
+                originalRegister.implementation = function(listener, sensor, rate) {
+                    log("Sensor registered: type=" + (sensor ? sensor.getType() : "null"));
+                    return originalRegister.call(this, listener, sensor, rate);
+                };
+                log("SensorManager hooked");
+            } catch(e) { log("SensorManager hook failed: " + e); }
+
+            // --- Battery ---
+            try {
+                var Intent = Java.use("android.content.Intent");
+                Intent.getIntExtra.overload('java.lang.String','int').implementation = function(key, def) {
+                    if (key === "level") return 87;
+                    if (key === "scale") return 100;
+                    if (key === "voltage") return 4200;
+                    if (key === "temperature") return 310;
+                    if (key === "status") return 2;
+                    if (key === "health") return 2;
+                    if (key === "plugged") return 1;
+                    if (key === "technology") return "Li-ion";
+                    return this.getIntExtra(key, def);
+                };
+                log("Battery hooked");
+            } catch(e) { log("Battery hook failed: " + e); }
+
+            // --- PackageManager block emulator apps ---
+            try {
+                var PM = Java.use("android.content.pm.PackageManager");
+                PM.getPackageInfo.overload('java.lang.String','int').implementation = function(pkg, flags) {
+                    var s = pkg.toString().toLowerCase();
+                    if (s.indexOf("ldplayer") !== -1 || s.indexOf("bluestacks") !== -1 ||
+                        s.indexOf("nox") !== -1 || s.indexOf("memu") !== -1 ||
+                        s.indexOf("emulator") !== -1) {
+                        throw PM.NameNotFoundException.$new(pkg);
+                    }
+                    return this.getPackageInfo(pkg, flags);
+                };
+                log("PackageManager hooked");
+            } catch(e) { log("PackageManager hook failed: " + e); }
+
+            // --- Tencent Hawk Anti-Cheat ---
+            try {
+                var HawkNative = Java.use("com.tencent.hawk.bridge.HawkNative");
+                var hawkMethods = ["checkEmulator", "checkAntiData"];
+                hawkMethods.forEach(function(m) {
+                    try {
+                        var overloads = HawkNative[m].overloads;
+                        overloads.forEach(function(ovl) {
+                            ovl.implementation = function() {
+                                log("HawkNative." + m + " -> 0");
+                                return 0;
+                            };
+                        });
+                    } catch(e) {}
+                });
+                log("HawkNative hooked");
+            } catch(e) { log("HawkNative hook failed: " + e); }
         });
     } catch(e) { log("installJavaHooks error: " + e); }
 }
 
 function main() {
     log("=== Emulator Bypass Starting ===");
+
+    try {
+        Process.setExceptionHandler(function(details) {
+            log("NATIVE CRASH: type=" + details.type + " address=" + details.address +
+                " memory=" + (details.memory ? details.memory.address : "n/a") +
+                " context pc=" + (details.context ? details.context.pc : "n/a"));
+            return false;
+        });
+        log("Exception handler installed");
+    } catch(e) {
+        log("Exception handler failed: " + e);
+    }
+
     installNativeHooks();
 
-    // Defer Java hooks until runtime is ready
-    var javaAttempts = 0;
-    var javaInterval = setInterval(function() {
-        javaAttempts++;
+    // Quick Java check — LD Player's libhoudini breaks Frida Java bridge entirely
+    setTimeout(function() {
         try {
             if (typeof Java !== 'undefined' && Java.available) {
-                clearInterval(javaInterval);
+                log("Java available, installing hooks");
                 installJavaHooks();
-            } else if (javaAttempts > 100) {
-                clearInterval(javaInterval);
-                log("Java never became available");
+            } else {
+                log("Java unavailable (normal on LD Player), using native hooks only");
             }
         } catch(e) {
             log("Java check error: " + e);
         }
-    }, 100);
+    }, 2000);
 }
 
 main();
