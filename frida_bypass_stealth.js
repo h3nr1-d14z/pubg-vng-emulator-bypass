@@ -71,6 +71,16 @@ function hookPropertyGet() {
         for (var i = 0; i < exps.length; i++) { if (exps[i].name === "__system_property_get") { addr = exps[i].address; break; } }
         if (!addr) { log("prop_get not found"); return; }
 
+        var x86Hide = {
+            "dalvik.vm.isa.x86.features": true,
+            "dalvik.vm.isa.x86.variant": true,
+            "dalvik.vm.isa.x86_64.features": true,
+            "dalvik.vm.isa.x86_64.variant": true,
+            "ro.dalvik.vm.native.bridge": true,
+            "ro.enable.native.bridge.exec": true,
+            "ro.enable.native.bridge.exec64": true
+        };
+
         var fp = {
             "ro.hardware": "qcom",
             "ro.product.model": "SM-S928B",
@@ -83,6 +93,12 @@ function hookPropertyGet() {
             "ro.product.cpu.abilist": "arm64-v8a,armeabi-v7a,armeabi",
             "ro.product.cpu.abilist32": "armeabi-v7a,armeabi",
             "ro.product.cpu.abilist64": "arm64-v8a",
+            "ro.vendor.product.cpu.abi": "arm64-v8a",
+            "ro.vendor.product.cpu.abilist": "arm64-v8a,armeabi-v7a,armeabi",
+            "ro.vendor.product.cpu.abilist32": "armeabi-v7a,armeabi",
+            "ro.vendor.product.cpu.abilist64": "arm64-v8a",
+            "ro.dalvik.vm.isa.arm": "arm64-v8a",
+            "ro.dalvik.vm.isa.arm64": "arm64-v8a",
             "ro.boot.hardware": "qcom",
             "ro.board.platform": "sm8650",
             "ro.arch": "arm64",
@@ -118,6 +134,12 @@ function hookPropertyGet() {
             }),
             onLeave: wrap("prop.onLeave", function(retval) {
                 if (!this.key || !this.buf) return;
+                if (x86Hide[this.key]) {
+                    log("Hide x86 prop: " + this.key);
+                    this.buf.writeUtf8String("");
+                    retval.replace(0);
+                    return;
+                }
                 if (fp[this.key]) {
                     log("Prop " + this.key + " -> " + fp[this.key]);
                     this.buf.writeUtf8String(fp[this.key]);
