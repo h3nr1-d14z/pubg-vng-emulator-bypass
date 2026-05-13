@@ -96,9 +96,28 @@ If running Frida from a different machine than the emulator, ensure adb over net
 └── fake_maps              # Fake /proc/self/maps content
 ```
 
+## Root Detection & Network Error
+
+In addition to emulator detection, PUBG Mobile VNG checks for root access. If root is detected, the server may return a network error instead of showing the emulator dialog. The bypass script must hide root indicators.
+
+### Root Detection Vectors to Hide
+
+- **SU binaries**: `/system/bin/su`, `/system/xbin/su`, `/sbin/su`, `/su/bin/su`, `/data/local/xbin/su`, `/data/local/bin/su`
+- **Root apps**: `/system/app/Superuser.apk`, `/system/priv-app/Superuser.apk`
+- **Magisk paths**: `/data/adb/magisk/`, `/sbin/.magisk/`
+- **System properties**: `ro.secure=1`, `ro.debuggable=0`
+- **Build tags**: `ro.build.tags=release-keys` (must not contain "test-keys")
+
+### How to Hide Root in Frida
+
+Extend `redirectPath()` in `frida_bypass_diag.js` to intercept `access`/`faccessat`/`stat`/`lstat` for the above paths and return `ENOENT` (file not found). Also extend `hookPropertyGet()` to return the safe values for `ro.secure` and `ro.debuggable`.
+
+If using Magisk, enable **Magisk Hide** or **Zygisk DenyList** for `com.vng.pubgmobile` alongside the Frida bypass.
+
 ## Next Steps / TODO
 
 - [ ] Verify network hooks actually intercept ANOGS 0x4013 packets
 - [ ] Add syscall-based `connect`/`send`/`recv` bypass if libc hooks miss
 - [ ] Test against updated game versions
 - [ ] Investigate plugin-process-specific detection vectors (SMInterceptor)
+- [ ] Add root-hide hooks (`su` binaries, Magisk paths) to prevent network error
