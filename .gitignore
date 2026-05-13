@@ -36,3 +36,8 @@ temp/
 # Claude / OMC local state
 .omc/
 .claude/
+
+# Reverse engineering targets (do not commit third-party executables)
+SUPERMANOFFICIAL.exe
+OW.exe
+1.BypasSNAKE 4.4/
