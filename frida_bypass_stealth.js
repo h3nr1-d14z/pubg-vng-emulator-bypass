@@ -112,6 +112,11 @@ function hookPropertyGet() {
             "ro.build.user": "dpi",
             "ro.build.host": "swdk-at-slave-258",
             "ro.build.flavor": "e3qxxx-user",
+            "ro.build.fingerprint": "samsung/e3qxxx/e3q:14/UP1A.231005.007/S928BXXU1AWM9:user/release-keys",
+            "ro.bootimage.build.fingerprint": "samsung/e3qxxx/e3q:14/UP1A.231005.007/S928BXXU1AWM9:user/release-keys",
+            "ro.vendor.build.fingerprint": "samsung/e3qxxx/e3q:14/UP1A.231005.007/S928BXXU1AWM9:user/release-keys",
+            "ro.build.version.incremental": "S928BXXU1AWM9",
+            "ro.build.version.security_patch": "2024-01-01",
             "ro.bootloader": "S928BXXU1AWM9",
             "ro.boot.mode": "unknown",
             "ro.boot.verifiedbootstate": "green",
@@ -165,7 +170,10 @@ var rootPaths = [
     "/system/app/Superuser.apk", "/system/app/SuperSU",
     "/system/bin/magisk", "/system/xbin/magisk", "/sbin/magisk",
     "/magisk", "/.magisk", "/sbin/.magisk",
-    "/data/adb/magisk", "/data/adb/ksu"
+    "/data/adb/magisk", "/data/adb/ksu",
+    "/system/bin/houdini", "/system/bin/houdini64",
+    "/system/lib/libhoudini.so", "/system/lib64/libhoudini.so",
+    "/system/lib/libnb.so", "/system/lib64/libnb.so"
 ];
 
 function redirectPath(pathPtr, pathStr) {
